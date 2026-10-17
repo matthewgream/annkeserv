@@ -1,0 +1,21 @@
+[Unit]
+Description=annkeserv - camera archive viewer
+Documentation=file:/opt/annkeserv/README.md
+Wants=network-online.target
+After=network-online.target
+Requires=annkeserv-storage.service
+After=annkeserv-storage.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/annkeserv /etc/default/annkeserv
+Restart=on-failure
+RestartSec=5s
+# read-only: it only serves the archive
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

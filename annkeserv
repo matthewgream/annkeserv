@@ -1,0 +1,325 @@
+#!/usr/bin/env node
+//
+// annkeserv -- browse the camera archive over HTTP, for the house: a selector of cameras, a calendar of
+// the days each camera has, and per day the day's clips in time order.
+//
+// Pages follow the weather archiver's snapshot pages (/opt/weather/server/http, server-snapshot-*.ejs)
+// in look and layout, without its dependencies: plain node:http, basic auth (blank user, password), and
+// files served with byte ranges so that video can seek.
+//
+//     /                           -> /<first camera>/list
+//     /<camera>/list              calendar of the camera's days, newest first
+//     /<camera>/list/<YYYYMMDD>   the day's files, oldest first: time, length, size, link
+//     /<camera>/file/<file>       a file, from <YYYYMMDD>/ or the camera's top level
+//
+// A camera's directory holds either day subdirectories (<YYYYMMDD>/recording_<YYYYMMDDHHMMSS>.mp4, as
+// annkepull writes) or just top-level files with the date in their name (timelapse_<YYYYMMDD>.mp4). A day
+// with a subdirectory links to its day page; a day that is a single top-level file links to the file.
+//
+// Config: /etc/default/annkeserv (key=value).   Usage: annkeserv [config]
+
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+const { pipeline } = require('stream');
+
+// ------------------------------------------------------------------------------------------ config
+
+const CFG_FILE = process.argv[2] || '/etc/default/annkeserv';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`annkeserv: ${CFG_FILE}: ${e.message}`);
+    process.exit(1);
+}
+const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
+
+const CAMERAS = Object.entries(cfg)                 // camera-<name>=<directory>, in selector order
+    .filter(([k, v]) => k.startsWith('camera-') && v)
+    .map(([k, v]) => ({ name: k.slice('camera-'.length), dir: v }));
+const PORT = num('port', 8088);
+const USERNAME = cfg['username'] || '';
+const PASSWORD = cfg['password'] || '';             // empty: no login
+
+if (!CAMERAS.length) {
+    console.error(`annkeserv: ${CFG_FILE}: no camera-<name>=<directory> entries`);
+    process.exit(1);
+}
+
+// ------------------------------------------------------------------------------------------ archive
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const RE_DAY = /^\d{8}$/;
+const RE_FILE = /^[\w-]*?(\d{8})(\d{6})?(?:_\d+)?\.mp4$/;   // <prefix>_<YYYYMMDD>[<HHMMSS>][_<n>].mp4
+const fmtDate = (d) => `${d.slice(0, 4)} ${MONTHS[Number(d.slice(4, 6)) - 1]} ${Number(d.slice(6, 8))}`;
+const fmtTime = (t) => `${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
+const fmtSize = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+const fmtLength = (secs) => {
+    const s = Math.round(secs), two = (n) => String(n).padStart(2, '0');
+    if (s >= 3600) return `${Math.floor(s / 3600)}h${two(Math.floor((s % 3600) / 60))}m`;
+    return s >= 60 ? `${Math.floor(s / 60)}m${two(s % 60)}s` : `${s}s`;
+};
+
+// date -> { dir: true } for a day subdirectory, or { files: [name, ...] } for top-level files of that date
+async function listDays(cam) {
+    const days = new Map();
+    for (const entry of await fs.promises.readdir(cam.dir, { withFileTypes: true })) {
+        if (entry.isDirectory() && RE_DAY.test(entry.name)) days.set(entry.name, { ...days.get(entry.name), dir: true });
+        else if (entry.isFile() && RE_FILE.test(entry.name)) {
+            const date = RE_FILE.exec(entry.name)[1], day = days.get(date) || {};
+            days.set(date, { ...day, files: [...(day.files || []), entry.name] });
+        }
+    }
+    return days;
+}
+
+// mp4 length from the movie header (mvhd); annkepull writes with +faststart so it is near the start
+const lengths = new Map();                          // file -> { mtimeMs, secs }
+async function mp4Length(file, stat) {
+    const known = lengths.get(file);
+    if (known?.mtimeMs === stat.mtimeMs) return known.secs;
+    let secs;
+    const fh = await fs.promises.open(file, 'r');
+    try {
+        const { buffer, bytesRead } = await fh.read(Buffer.alloc(65536), 0, 65536, 0);
+        const at = buffer.subarray(0, bytesRead).indexOf('mvhd');
+        if (at >= 4 && at + 36 <= bytesRead)
+            secs = buffer[at + 4] === 1
+                ? Number(buffer.readBigUInt64BE(at + 28)) / buffer.readUInt32BE(at + 24)
+                : buffer.readUInt32BE(at + 20) / buffer.readUInt32BE(at + 16);
+    } finally {
+        await fh.close();
+    }
+    lengths.set(file, { mtimeMs: stat.mtimeMs, secs });
+    return secs;
+}
+
+async function listDay(cam, date) {
+    const dir = path.join(cam.dir, date);
+    const names = (await fs.promises.readdir(dir)).filter((n) => RE_FILE.test(n) && RE_FILE.exec(n)[1] === date).sort();
+    return Promise.all(
+        names.map(async (name) => {
+            const file = path.join(dir, name), stat = await fs.promises.stat(file);
+            return { name, time: RE_FILE.exec(name)[2], size: stat.size, secs: await mp4Length(file, stat).catch(() => undefined) };
+        })
+    );
+}
+
+function findFile(cam, name) {
+    const m = RE_FILE.exec(name);
+    if (!m) return undefined;
+    for (const file of [path.join(cam.dir, m[1], name), path.join(cam.dir, name)]) if (fs.existsSync(file)) return file;
+    return undefined;
+}
+
+// ------------------------------------------------------------------------------------------ pages
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const ICON =
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%234299e1'/%3E%3Cstop offset='100%25' stop-color='%233182ce'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='96' cy='96' r='88' fill='url(%23g)'/%3E%3Cg fill='white'%3E%3Crect x='44' y='70' width='76' height='54' rx='8'/%3E%3Cpath d='M126,88l26-16v48l-26-16z'/%3E%3C/g%3E%3C/svg%3E";
+const STYLE = `
+        body { font-family: 'Inter', sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f0f4f8; color: #2d3748; }
+        h1 { color: #4299e1; margin-bottom: 20px; }
+        h1 a { color: inherit; text-decoration: none; }
+        h1 a:hover { text-decoration: underline; }
+        .selector { display: flex; gap: 8px; }
+        .selector a { padding: 6px 16px; border-radius: 8px; background-color: white; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); color: #4299e1; text-decoration: none; font-weight: 500; }
+        .selector a:hover { text-decoration: underline; }
+        .selector a.current { background-color: #4299e1; color: white; }
+        .week-group, .item-list { background-color: white; padding: 8px 16px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); }
+        .week-row { font-family: monospace; white-space: nowrap; line-height: 1.5; margin-bottom: 4px; display: flex; font-size: 16px; }
+        .month-label { font-weight: bold; margin-right: 8px; min-width: 120px; }
+        .date-grid { display: grid; grid-template-columns: repeat(7, 28px); }
+        .date-link { text-decoration: none; color: #4299e1; text-align: center; }
+        .date-link:hover { text-decoration: underline; }
+        .date-placeholder { text-align: center; }
+        .item-entry { padding: 3px 0; display: flex; align-items: center; }
+        .item-entry a { color: #4299e1; text-decoration: none; }
+        .item-entry a:hover { text-decoration: underline; }
+        .item-detail { font-weight: 500; min-width: 80px; margin-right: 16px; }
+        .item-meta { font-family: monospace; min-width: 160px; margin-right: 16px; color: #718096; }
+        .empty { color: #718096; }`;
+
+function page(title, cam, date, body) {
+    // the selector keeps the day when the other camera has it
+    const selector = CAMERAS.map((c) => {
+        const href = date && fs.existsSync(path.join(c.dir, date)) ? `/${c.name}/list/${date}` : `/${c.name}/list`;
+        return `<a href="${esc(href)}"${c === cam ? ' class="current"' : ''}>${esc(c.name)}</a>`;
+    }).join('');
+    return `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${esc(title)}</title>
+    <link rel="icon" href="${ICON}">
+    <style>${STYLE}
+    </style>
+</head>
+<body>
+    <div class="selector">${selector}</div>
+${body}
+</body>
+</html>
+`;
+}
+
+// as server-snapshot-list.ejs: one row per week, newest first, each row laid out Sunday .. Monday
+function calendar(cam, days) {
+    const months = [...new Set([...days.keys()].map((d) => d.slice(0, 6)))].sort().reverse();
+    const rows = [];
+    for (const yearMonth of months) {
+        const year = Number(yearMonth.slice(0, 4)), month = Number(yearMonth.slice(4, 6));
+        const weeks = [];
+        let week = Array(7).fill(null);
+        for (let day = new Date(year, month, 0).getDate(); day >= 1; day--) {
+            const dayOfWeek = new Date(year, month - 1, day).getDay(), date = `${yearMonth}${String(day).padStart(2, '0')}`;
+            week[[0, 6, 5, 4, 3, 2, 1].indexOf(dayOfWeek)] = { day, date, info: days.get(date) };
+            if (dayOfWeek === 1 || day === 1) {
+                weeks.push(week);
+                week = Array(7).fill(null);
+            }
+        }
+        const hasData = (w) => w.some((d) => d?.info);
+        const first = weeks.findIndex(hasData), last = weeks.findLastIndex(hasData);
+        for (const w of weeks.slice(first, last + 1)) {
+            const cells = w.map((d) => {
+                if (!d) return '<span class="date-placeholder"></span>';
+                const text = String(d.day).padStart(2, ' ');
+                if (d.info?.dir) return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link">${text}</a>`;
+                if (d.info?.files?.length === 1) return `<a href="/${esc(cam.name)}/file/${esc(d.info.files[0])}" class="date-link">${text}</a>`;
+                if (d.info?.files?.length) return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link">${text}</a>`;
+                return `<span class="date-placeholder">${text}</span>`;
+            });
+            rows.push(`
+            <div class="week-row">
+                <div class="month-label">${year} ${MONTHS[month - 1]}:</div>
+                <div class="date-grid">${cells.join('')}</div>
+            </div>`);
+        }
+    }
+    return rows.join('');
+}
+
+async function pageList(cam) {
+    const days = await listDays(cam);
+    const body = days.size
+        ? `    <h1>${esc(cam.name)} (${days.size} days)</h1>
+    <div class="week-group">${calendar(cam, days)}
+    </div>`
+        : `    <h1>${esc(cam.name)}</h1>
+    <p class="empty">Nothing archived yet.</p>`;
+    return page(`Camera: ${cam.name}`, cam, undefined, body);
+}
+
+async function pageDay(cam, date, days) {
+    let entries;
+    if (days.get(date)?.dir) entries = await listDay(cam, date);
+    else
+        entries = await Promise.all(
+            (days.get(date)?.files || []).sort().map(async (name) => {
+                const stat = await fs.promises.stat(path.join(cam.dir, name));
+                return { name, time: RE_FILE.exec(name)[2], size: stat.size };
+            })
+        );
+    const total = entries.reduce((t, e) => t + (e.secs || 0), 0);
+    const rows = entries.map(
+        (e) => `
+            <div class="item-entry">
+                <span class="item-detail">${e.time ? fmtTime(e.time) : ''}</span><span class="item-meta">${e.secs !== undefined ? fmtLength(e.secs).padStart(6, ' ').replace(/ /g, '&nbsp;') + ' &middot; ' : ''}${fmtSize(e.size)}</span><a href="/${esc(cam.name)}/file/${esc(e.name)}" target="_blank">View Video</a>
+            </div>`
+    );
+    const body = `    <h1><a href="/${esc(cam.name)}/list">${esc(cam.name)}</a>: ${fmtDate(date)}</h1>
+    <p>${entries.length} clip${entries.length === 1 ? '' : 's'}${total ? `, ${fmtLength(total)} in all` : ''}</p>
+    <div class="item-list">${rows.join('')}
+    </div>`;
+    return page(`Camera: ${cam.name}: ${fmtDate(date)}`, cam, date, body);
+}
+
+// ------------------------------------------------------------------------------------------ http
+
+const digest = (s) => crypto.createHash('sha256').update(s).digest();
+function authorised(req) {
+    if (!PASSWORD) return true;
+    const m = /^Basic\s+(\S+)$/i.exec(req.headers.authorization || '');
+    if (!m) return false;
+    const given = Buffer.from(m[1], 'base64').toString(), colon = given.indexOf(':');
+    if (colon < 0) return false;
+    return given.slice(0, colon) === USERNAME && crypto.timingSafeEqual(digest(given.slice(colon + 1)), digest(PASSWORD));
+}
+
+function sendHtml(res, html) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+    res.end(html);
+}
+
+function sendFile(req, res, file) {
+    const stat = fs.statSync(file);
+    const headers = {
+        'Content-Type': file.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+        'Accept-Ranges': 'bytes',
+        'Last-Modified': stat.mtime.toUTCString(),
+        'Cache-Control': 'private, max-age=86400',
+    };
+    let start = 0, end = stat.size - 1, status = 200;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (range && (range[1] || range[2])) {
+        if (range[1]) [start, end] = [Number(range[1]), range[2] ? Math.min(Number(range[2]), end) : end];
+        else start = Math.max(0, stat.size - Number(range[2]));
+        if (start > end) {
+            res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+            return res.end();
+        }
+        status = 206;
+        headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
+    }
+    headers['Content-Length'] = end - start + 1;
+    res.writeHead(status, headers);
+    if (req.method === 'HEAD') return res.end();
+    return pipeline(fs.createReadStream(file, { start, end }), res, () => {});
+}
+
+async function route(req, res) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { Allow: 'GET, HEAD' });
+        return res.end();
+    }
+    if (!authorised(req)) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="annkeserv"', 'Content-Type': 'text/plain' });
+        return res.end('Authentication required');
+    }
+    const parts = decodeURIComponent(new URL(req.url, 'http://x').pathname).split('/').filter(Boolean);
+    if (!parts.length) {
+        res.writeHead(302, { Location: `/${CAMERAS[0].name}/list` });
+        return res.end();
+    }
+    const cam = CAMERAS.find((c) => c.name === parts[0]);
+    if (cam && parts[1] === 'list' && parts.length === 2) return sendHtml(res, await pageList(cam));
+    if (cam && parts[1] === 'list' && parts.length === 3 && RE_DAY.test(parts[2])) {
+        const days = await listDays(cam);
+        if (days.has(parts[2])) return sendHtml(res, await pageDay(cam, parts[2], days));
+    }
+    if (cam && parts[1] === 'file' && parts.length === 3) {
+        const file = findFile(cam, parts[2]);
+        if (file) return sendFile(req, res, file);
+    }
+    console.error(`annkeserv: 404 ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    return res.end('not found');
+}
+
+http.createServer((req, res) =>
+    route(req, res).catch((e) => {
+        console.error(`annkeserv: ${req.method} ${req.url}: ${e.message}`);
+        if (!res.headersSent) res.writeHead(e.code === 'ENOENT' ? 404 : 500, { 'Content-Type': 'text/plain' });
+        res.end(e.code === 'ENOENT' ? 'not found' : 'error');
+    })
+).listen(PORT, () =>
+    console.log(`annkeserv: ${CAMERAS.map((c) => `${c.name}=${c.dir}`).join(' ')}, port ${PORT}, ${PASSWORD ? 'login' : 'no login'}`)
+);
