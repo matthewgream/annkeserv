@@ -40,6 +40,22 @@ Each `camera-<name>=<directory>` is one of two shapes, told apart by what is in 
 Clip lengths are read from each mp4's movie header (near the start, as annkepull writes with
 `+faststart`) and remembered while the file is unchanged.
 
+## What was seen
+
+annkedetect writes beside each clip what it saw (`recording_<...>.json`, `{"seen": {"people": 0.85, ...}}`)
+and, when it saw something, a thumbnail with the detections boxed (`.jpg`). annkeserv shows them without
+adding weight to the pages:
+
+- a day's page marks a clip with 🚶 people, 🐾 animals, 🚗 vehicles; hovering the icons shows the
+  thumbnail (loaded only then), and on a phone tapping them opens it; the header counts the clips with
+  each, and how many have been checked so far;
+- the calendar shows days with anything seen in orange, and hovering any day gives a card with its clip
+  count and what was seen.
+
+A day's results are read once per change of its directory (annkedetect renames its files into place,
+which updates the directory's mtime), and all of them once at startup, in the background, so the
+calendar does not wait on hundreds of small reads.
+
 Login is HTTP basic, as the weather archiver: blank user, the configured password. An empty
 `password=` turns the login off.
 

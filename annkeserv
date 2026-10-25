@@ -9,12 +9,17 @@
 //
 //     /                           -> /<first camera>/list
 //     /<camera>/list              calendar of the camera's days, newest first
-//     /<camera>/list/<YYYYMMDD>   the day's files, oldest first: time, length, size, link
-//     /<camera>/file/<file>       a file, from <YYYYMMDD>/ or the camera's top level
+//     /<camera>/list/<YYYYMMDD>   the day's files, oldest first: time, length, size, link, what was seen
+//     /<camera>/file/<file>       a file, from <YYYYMMDD>/ or the camera's top level (or a clip's .jpg)
 //
 // A camera's directory holds either day subdirectories (<YYYYMMDD>/recording_<YYYYMMDDHHMMSS>.mp4, as
 // annkepull writes) or just top-level files with the date in their name (timelapse_<YYYYMMDD>.mp4). A day
 // with a subdirectory links to its day page; a day that is a single top-level file links to the file.
+//
+// annkedetect writes beside each clip what it saw (recording_<...>.json) and, when it saw something, a
+// thumbnail with boxes (.jpg). A day's page marks those clips with an icon per group, the thumbnail on
+// hover; the calendar shows such days in orange, with their counts on hover. A day's results are read once
+// per change of its directory (annkedetect renames its files into place, which updates the mtime).
 //
 // Config: /etc/default/annkeserv (key=value).   Usage: annkeserv [config]
 
@@ -100,19 +105,53 @@ async function mp4Length(file, stat) {
     return secs;
 }
 
+// annkedetect's results for a day's directory: per clip what was seen (group -> best score) and whether
+// there is a thumbnail, and per group how many clips; re-read only when the directory has changed
+const GROUPS = { people: '🚶', animals: '🐾', vehicles: '🚗' };
+const dayResults = new Map();                       // dir -> { mtimeMs, clips, checked, groups, seen: Map(name -> { seen, thumb }) }
+async function results(dir) {
+    const stat = await fs.promises.stat(dir), known = dayResults.get(dir);
+    if (known?.mtimeMs === stat.mtimeMs) return known;
+    const names = await fs.promises.readdir(dir), have = new Set(names), seen = new Map(), groups = {};
+    const clips = names.filter((n) => RE_FILE.test(n));
+    await Promise.all(
+        clips
+            .filter((n) => have.has(n.replace(/\.mp4$/, '.json')))
+            .map(async (n) => {
+                try {
+                    const r = JSON.parse(await fs.promises.readFile(path.join(dir, n.replace(/\.mp4$/, '.json')), 'utf8'));
+                    seen.set(n, { seen: r.seen || {}, thumb: have.has(n.replace(/\.mp4$/, '.jpg')) });
+                } catch {
+                    /* unreadable: taken as not checked, until the directory next changes */
+                }
+            })
+    );
+    for (const r of seen.values()) for (const g of Object.keys(r.seen)) groups[g] = (groups[g] || 0) + 1;
+    const result = { mtimeMs: stat.mtimeMs, clips: clips.length, checked: seen.size, groups, seen };
+    dayResults.set(dir, result);
+    return result;
+}
+// for the calendar, which wants every day: what is cached, refreshed behind it; read now only when nothing is
+const resultsSoon = (dir) => {
+    const fresh = results(dir).catch(() => undefined);
+    return dayResults.get(dir) || fresh;
+};
+
 async function listDay(cam, date) {
     const dir = path.join(cam.dir, date);
     const names = (await fs.promises.readdir(dir)).filter((n) => RE_FILE.test(n) && RE_FILE.exec(n)[1] === date).sort();
-    return Promise.all(
+    const found = await results(dir).catch(() => undefined);
+    const entries = await Promise.all(
         names.map(async (name) => {
             const file = path.join(dir, name), stat = await fs.promises.stat(file);
-            return { name, time: RE_FILE.exec(name)[2], size: stat.size, secs: await mp4Length(file, stat).catch(() => undefined) };
+            return { name, time: RE_FILE.exec(name)[2], size: stat.size, secs: await mp4Length(file, stat).catch(() => undefined), ...found?.seen.get(name) };
         })
     );
+    return { entries, found };
 }
 
 function findFile(cam, name) {
-    const m = RE_FILE.exec(name);
+    const m = RE_FILE.exec(name.replace(/\.jpg$/, '.mp4'));     // a clip, or annkedetect's thumbnail of it
     if (!m) return undefined;
     for (const file of [path.join(cam.dir, m[1], name), path.join(cam.dir, name)]) if (fs.existsSync(file)) return file;
     return undefined;
@@ -136,8 +175,14 @@ const STYLE = `
         .week-row { font-family: monospace; white-space: nowrap; line-height: 1.5; margin-bottom: 4px; display: flex; font-size: 16px; }
         .month-label { font-weight: bold; margin-right: 8px; min-width: 120px; }
         .date-grid { display: grid; grid-template-columns: repeat(7, 28px); }
-        .date-link { text-decoration: none; color: #4299e1; text-align: center; }
+        .date-link { text-decoration: none; color: #4299e1; text-align: center; position: relative; }
         .date-link:hover { text-decoration: underline; }
+        .date-link.seen { color: #ed8936; }
+        .date-link .card { display: none; position: absolute; left: 0; top: 100%; z-index: 5; padding: 6px 10px; border-radius: 8px; background-color: white;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2); color: #2d3748; font-family: 'Inter', sans-serif; font-size: 13px; text-align: left; white-space: nowrap; }
+        .date-link:hover .card { display: block; }
+        .item-seen { margin-left: 16px; text-decoration: none; }
+        #thumb { display: none; position: fixed; z-index: 10; width: 640px; max-width: 90vw; border-radius: 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); pointer-events: none; }
         .date-placeholder { text-align: center; }
         .item-entry { padding: 3px 0; display: flex; align-items: center; }
         .item-entry a { color: #4299e1; text-decoration: none; }
@@ -170,8 +215,19 @@ ${body}
 `;
 }
 
+// a clip count and what annkedetect saw, as a list of lines
+function seenLines(found) {
+    if (!found) return [];
+    const lines = [`${found.clips} clip${found.clips === 1 ? '' : 's'}`];
+    if (!found.checked) return [...lines, 'not checked yet'];
+    const groups = Object.keys(GROUPS).filter((g) => found.groups[g]);
+    lines.push(...(groups.length ? groups.map((g) => `${GROUPS[g]} ${g} in ${found.groups[g]}`) : ['nothing seen']));
+    if (found.checked < found.clips) lines.push(`${found.checked} of ${found.clips} checked`);
+    return lines;
+}
+
 // as server-snapshot-list.ejs: one row per week, newest first, each row laid out Sunday .. Monday
-function calendar(cam, days) {
+function calendar(cam, days, found) {
     const months = [...new Set([...days.keys()].map((d) => d.slice(0, 6)))].sort().reverse();
     const rows = [];
     for (const yearMonth of months) {
@@ -192,7 +248,11 @@ function calendar(cam, days) {
             const cells = w.map((d) => {
                 if (!d) return '<span class="date-placeholder"></span>';
                 const text = String(d.day).padStart(2, ' ');
-                if (d.info?.dir) return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link">${text}</a>`;
+                if (d.info?.dir) {
+                    const f = found.get(d.date), lines = seenLines(f);
+                    const card = lines.length ? `<span class="card">${[fmtDate(d.date), ...lines].map(esc).join('<br>')}</span>` : '';
+                    return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link${Object.keys(f?.groups || {}).length ? ' seen' : ''}">${text}${card}</a>`;
+                }
                 if (d.info?.files?.length === 1) return `<a href="/${esc(cam.name)}/file/${esc(d.info.files[0])}" class="date-link">${text}</a>`;
                 if (d.info?.files?.length) return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link">${text}</a>`;
                 return `<span class="date-placeholder">${text}</span>`;
@@ -209,18 +269,41 @@ function calendar(cam, days) {
 
 async function pageList(cam) {
     const days = await listDays(cam);
+    const found = new Map(
+        await Promise.all([...days].filter(([, info]) => info.dir).map(async ([date]) => [date, await resultsSoon(path.join(cam.dir, date))]))
+    );
     const body = days.size
         ? `    <h1>${esc(cam.name)} (${days.size} days)</h1>
-    <div class="week-group">${calendar(cam, days)}
+    <div class="week-group">${calendar(cam, days, found)}
     </div>`
         : `    <h1>${esc(cam.name)}</h1>
     <p class="empty">Nothing archived yet.</p>`;
     return page(`Camera: ${cam.name}`, cam, undefined, body);
 }
 
+// shows a clip's thumbnail by the pointer while over its icons; loaded on the first hover, so the list stays light
+const THUMB_SCRIPT = `
+    <img id="thumb" alt="">
+    <script>
+        const thumb = document.getElementById('thumb');
+        let at;
+        // beside the pointer, kept on screen (again once loaded, when its size is known)
+        const place = (e) => {
+            at = e || at;
+            thumb.style.left = Math.max(8, Math.min(at.clientX + 16, innerWidth - thumb.offsetWidth - 8)) + 'px';
+            thumb.style.top = Math.max(8, Math.min(at.clientY + 16, innerHeight - thumb.offsetHeight - 8)) + 'px';
+        };
+        for (const a of document.querySelectorAll('a.item-seen')) {
+            a.addEventListener('mouseenter', (e) => { thumb.src = a.href; thumb.style.display = 'block'; place(e); });
+            a.addEventListener('mousemove', place);
+            a.addEventListener('mouseleave', () => { thumb.style.display = 'none'; });
+        }
+        thumb.addEventListener('load', () => at && place());
+    </script>`;
+
 async function pageDay(cam, date, days) {
-    let entries;
-    if (days.get(date)?.dir) entries = await listDay(cam, date);
+    let entries, found;
+    if (days.get(date)?.dir) ({ entries, found } = await listDay(cam, date));
     else
         entries = await Promise.all(
             (days.get(date)?.files || []).sort().map(async (name) => {
@@ -229,16 +312,24 @@ async function pageDay(cam, date, days) {
             })
         );
     const total = entries.reduce((t, e) => t + (e.secs || 0), 0);
+    const seenIcons = (e) => {
+        const icons = Object.keys(GROUPS).filter((g) => e.seen?.[g] !== undefined).map((g) => GROUPS[g]).join('');
+        if (!icons) return '';
+        return e.thumb
+            ? `<a class="item-seen" href="/${esc(cam.name)}/file/${esc(e.name.replace(/\.mp4$/, '.jpg'))}" target="_blank">${icons}</a>`
+            : `<span class="item-seen">${icons}</span>`;
+    };
     const rows = entries.map(
         (e) => `
             <div class="item-entry">
-                <span class="item-detail">${e.time ? fmtTime(e.time) : ''}</span><span class="item-meta">${e.secs !== undefined ? fmtLength(e.secs).padStart(6, ' ').replace(/ /g, '&nbsp;') + ' &middot; ' : ''}${fmtSize(e.size)}</span><a href="/${esc(cam.name)}/file/${esc(e.name)}" target="_blank">View Video</a>
+                <span class="item-detail">${e.time ? fmtTime(e.time) : ''}</span><span class="item-meta">${e.secs !== undefined ? fmtLength(e.secs).padStart(6, ' ').replace(/ /g, '&nbsp;') + ' &middot; ' : ''}${fmtSize(e.size)}</span><a href="/${esc(cam.name)}/file/${esc(e.name)}" target="_blank">View Video</a>${seenIcons(e)}
             </div>`
     );
+    const seen = found?.checked ? seenLines(found).slice(1).join(' &middot; ') : '';
     const body = `    <h1><a href="/${esc(cam.name)}/list">${esc(cam.name)}</a>: ${fmtDate(date)}</h1>
-    <p>${entries.length} clip${entries.length === 1 ? '' : 's'}${total ? `, ${fmtLength(total)} in all` : ''}</p>
+    <p>${entries.length} clip${entries.length === 1 ? '' : 's'}${total ? `, ${fmtLength(total)} in all` : ''}${seen ? ` &middot; ${seen}` : ''}</p>
     <div class="item-list">${rows.join('')}
-    </div>`;
+    </div>${entries.some((e) => e.thumb) ? THUMB_SCRIPT : ''}`;
     return page(`Camera: ${cam.name}: ${fmtDate(date)}`, cam, date, body);
 }
 
@@ -262,7 +353,7 @@ function sendHtml(res, html) {
 function sendFile(req, res, file) {
     const stat = fs.statSync(file);
     const headers = {
-        'Content-Type': file.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+        'Content-Type': { '.mp4': 'video/mp4', '.jpg': 'image/jpeg' }[path.extname(file)] || 'application/octet-stream',
         'Accept-Ranges': 'bytes',
         'Last-Modified': stat.mtime.toUTCString(),
         'Cache-Control': 'private, max-age=86400',
@@ -320,6 +411,10 @@ http.createServer((req, res) =>
         if (!res.headersSent) res.writeHead(e.code === 'ENOENT' ? 404 : 500, { 'Content-Type': 'text/plain' });
         res.end(e.code === 'ENOENT' ? 'not found' : 'error');
     })
-).listen(PORT, () =>
-    console.log(`annkeserv: ${CAMERAS.map((c) => `${c.name}=${c.dir}`).join(' ')}, port ${PORT}, ${PASSWORD ? 'login' : 'no login'}`)
-);
+).listen(PORT, async () => {
+    console.log(`annkeserv: ${CAMERAS.map((c) => `${c.name}=${c.dir}`).join(' ')}, port ${PORT}, ${PASSWORD ? 'login' : 'no login'}`);
+    // read every day's results once now, a day at a time, so the first calendar shown is not the one that waits
+    for (const cam of CAMERAS)
+        for (const [date, info] of await listDays(cam).catch(() => new Map()))
+            if (info.dir) await results(path.join(cam.dir, date)).catch(() => undefined);
+});
