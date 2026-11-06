@@ -1,5 +1,16 @@
 # annkeserv
 
+One of three tools for an archive of Annke camera clips, each working on what the one before left:
+
+| | |
+|---|---|
+| [annkepull](https://github.com/matthewgream/annkepull) | fetches the event clips from the cameras' SD cards into the archive, every 6 hours |
+| [annkescan](https://github.com/matthewgream/annkescan) | flags the people, animals and vehicles in each clip, with a daily report to MQTT |
+| **annkeserv** | browses the archive over HTTP, with what annkescan found |
+
+They share nothing but the archive's files (`<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4`, with
+annkescan's `.json` and `.jpg` beside each clip), so each runs on its own.
+
 Browses the camera archive over HTTP, for the house: a selector of cameras at the top, a calendar of
 the days each camera has (newest first), and per day the day's clips in time order with their
 length and size. The public wide view stays on the weather archiver (port 80); this one is internal.
@@ -42,7 +53,7 @@ Clip lengths are read from each mp4's movie header (near the start, as annkepull
 
 ## What was seen
 
-annkedetect writes beside each clip what it saw (`recording_<...>.json`, `{"seen": {"people": 0.85, ...}}`)
+annkescan writes beside each clip what it saw (`recording_<...>.json`, `{"seen": {"people": 0.85, ...}}`)
 and, when it saw something, a thumbnail with the detections boxed (`.jpg`). annkeserv shows them without
 adding weight to the pages:
 
@@ -52,7 +63,7 @@ adding weight to the pages:
 - the calendar shows days with anything seen in orange, and hovering any day gives a card with its clip
   count and what was seen.
 
-A day's results are read once per change of its directory (annkedetect renames its files into place,
+A day's results are read once per change of its directory (annkescan renames its files into place,
 which updates the directory's mtime), and all of them once at startup, in the background, so the
 calendar does not wait on hundreds of small reads.
 

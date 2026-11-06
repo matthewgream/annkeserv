@@ -16,10 +16,10 @@
 // annkepull writes) or just top-level files with the date in their name (timelapse_<YYYYMMDD>.mp4). A day
 // with a subdirectory links to its day page; a day that is a single top-level file links to the file.
 //
-// annkedetect writes beside each clip what it saw (recording_<...>.json) and, when it saw something, a
+// annkescan writes beside each clip what it saw (recording_<...>.json) and, when it saw something, a
 // thumbnail with boxes (.jpg). A day's page marks those clips with an icon per group, the thumbnail on
 // hover; the calendar shows such days in orange, with their counts on hover. A day's results are read once
-// per change of its directory (annkedetect renames its files into place, which updates the mtime).
+// per change of its directory (annkescan renames its files into place, which updates the mtime).
 //
 // Config: /etc/default/annkeserv (key=value).   Usage: annkeserv [config]
 
@@ -105,7 +105,7 @@ async function mp4Length(file, stat) {
     return secs;
 }
 
-// annkedetect's results for a day's directory: per clip what was seen (group -> best score) and whether
+// annkescan's results for a day's directory: per clip what was seen (group -> best score) and whether
 // there is a thumbnail, and per group how many clips; re-read only when the directory has changed
 const GROUPS = { people: '🚶', animals: '🐾', vehicles: '🚗' };
 const dayResults = new Map();                       // dir -> { mtimeMs, clips, checked, groups, seen: Map(name -> { seen, thumb }) }
@@ -151,7 +151,7 @@ async function listDay(cam, date) {
 }
 
 function findFile(cam, name) {
-    const m = RE_FILE.exec(name.replace(/\.jpg$/, '.mp4'));     // a clip, or annkedetect's thumbnail of it
+    const m = RE_FILE.exec(name.replace(/\.jpg$/, '.mp4'));     // a clip, or annkescan's thumbnail of it
     if (!m) return undefined;
     for (const file of [path.join(cam.dir, m[1], name), path.join(cam.dir, name)]) if (fs.existsSync(file)) return file;
     return undefined;
@@ -215,7 +215,7 @@ ${body}
 `;
 }
 
-// a clip count and what annkedetect saw, as a list of lines
+// a clip count and what annkescan saw, as a list of lines
 function seenLines(found) {
     if (!found) return [];
     const lines = [`${found.clips} clip${found.clips === 1 ? '' : 's'}`];
