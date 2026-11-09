@@ -23,6 +23,7 @@ test: $(TARGET)
 
 INSTALL=annkeserv
 DIR_INSTALL=/usr/local/bin
+DIR_SHARE=/usr/local/share/$(INSTALL)
 DIR_DEFAULT=/etc/default
 DIR_SYSTEMD=/etc/systemd/system
 define install_service_systemd
@@ -35,6 +36,10 @@ define install_service_systemd
 endef
 install_target: $(TARGET)
 	install -m 755 $(TARGET) $(DIR_INSTALL)/$(INSTALL)
+# manifest icons, served unauthenticated so the home-screen install works
+install_pwa: pwa/icon-192.png pwa/icon-512.png pwa/icon-maskable-512.png
+	install -d $(DIR_SHARE)
+	install -m 644 $^ $(DIR_SHARE)
 # 600: it holds the password
 install_default: $(CFG_SRC)
 	@echo "installing config from $(CFG_SRC)"
@@ -43,13 +48,13 @@ install_storage: $(TARGET)-storage.service
 	$(call install_service_systemd,$(TARGET)-storage,$(INSTALL)-storage)
 install_service: $(TARGET).service
 	$(call install_service_systemd,$(TARGET),$(INSTALL))
-install: check install_target install_default install_storage install_service
+install: check install_target install_pwa install_default install_storage install_service
 restart:
 	systemctl restart $(INSTALL)
 status:
 	@systemctl --no-pager --lines=0 status $(INSTALL) || true
 	@journalctl -u $(INSTALL) -n 10 --no-pager -o cat
-.PHONY: install install_target install_default install_storage install_service
+.PHONY: install install_target install_pwa install_default install_storage install_service
 .PHONY: restart status
 
 ##

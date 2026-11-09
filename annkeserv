@@ -51,6 +51,7 @@ const CAMERAS = Object.entries(cfg)                 // camera-<name>=<directory>
 const PORT = num('port', 8088);
 const USERNAME = cfg['username'] || '';
 const PASSWORD = cfg['password'] || '';             // empty: no login
+const DIR_PWA = cfg['pwa'] || [path.join(__dirname, 'pwa'), '/usr/local/share/annkeserv'].find((d) => fs.existsSync(d));
 
 if (!CAMERAS.length) {
     console.error(`annkeserv: ${CFG_FILE}: no camera-<name>=<directory> entries`);
@@ -162,6 +163,22 @@ function findFile(cam, name) {
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const ICON =
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%234299e1'/%3E%3Cstop offset='100%25' stop-color='%233182ce'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='96' cy='96' r='88' fill='url(%23g)'/%3E%3Cg fill='white'%3E%3Crect x='44' y='70' width='76' height='54' rx='8'/%3E%3Cpath d='M126,88l26-16v48l-26-16z'/%3E%3C/g%3E%3C/svg%3E";
+const PWA_ICONS = ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png'];
+const MANIFEST = JSON.stringify({
+    id: '/',
+    name: 'annkeserv',
+    short_name: 'annkeserv',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    background_color: '#f0f4f8',
+    theme_color: '#3182ce',
+    icons: [
+        { src: '/pwa/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: '/pwa/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: '/pwa/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+});
 const STYLE = `
         body { font-family: 'Inter', sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f0f4f8; color: #2d3748; }
         h1 { color: #4299e1; margin-bottom: 20px; }
@@ -204,6 +221,9 @@ function page(title, cam, date, body) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${esc(title)}</title>
     <link rel="icon" href="${ICON}">
+    <link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+    <link rel="apple-touch-icon" href="/pwa/icon-192.png">
+    <meta name="theme-color" content="#3182ce">
     <style>${STYLE}
     </style>
 </head>
@@ -353,7 +373,7 @@ function sendHtml(res, html) {
 function sendFile(req, res, file) {
     const stat = fs.statSync(file);
     const headers = {
-        'Content-Type': { '.mp4': 'video/mp4', '.jpg': 'image/jpeg' }[path.extname(file)] || 'application/octet-stream',
+        'Content-Type': { '.mp4': 'video/mp4', '.jpg': 'image/jpeg', '.png': 'image/png' }[path.extname(file)] || 'application/octet-stream',
         'Accept-Ranges': 'bytes',
         'Last-Modified': stat.mtime.toUTCString(),
         'Cache-Control': 'private, max-age=86400',
@@ -381,6 +401,15 @@ async function route(req, res) {
         res.writeHead(405, { Allow: 'GET, HEAD' });
         return res.end();
     }
+    // install metadata stays open: android's webapk minting and the browser's manifest fetch can't present
+    // basic-auth credentials, and a gated manifest/icon degrades the install to a badged home-screen shortcut
+    const pathname = new URL(req.url, 'http://x').pathname;
+    if (pathname === '/manifest.json') {
+        res.writeHead(200, { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'no-cache' });
+        return res.end(MANIFEST);
+    }
+    const icon = pathname.startsWith('/pwa/') && pathname.slice('/pwa/'.length);
+    if (DIR_PWA && PWA_ICONS.includes(icon)) return sendFile(req, res, path.join(DIR_PWA, icon));
     if (!authorised(req)) {
         res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="annkeserv"', 'Content-Type': 'text/plain' });
         return res.end('Authentication required');
