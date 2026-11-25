@@ -10,16 +10,22 @@
 //     /                           -> /<first camera>/list
 //     /<camera>/list              calendar of the camera's days, newest first
 //     /<camera>/list/<YYYYMMDD>   the day's files, oldest first: time, length, size, link, what was seen
-//     /<camera>/file/<file>       a file, from <YYYYMMDD>/ or the camera's top level (or a clip's .jpg)
+//     /<camera>/file/<file>       a file, from <YYYYMMDD>/ or the camera's top level (or a clip's .jpg, or a
+//                                 detection)
 //
 // A camera's directory holds either day subdirectories (<YYYYMMDD>/recording_<YYYYMMDDHHMMSS>.mp4, as
-// annkepull writes) or just top-level files with the date in their name (timelapse_<YYYYMMDD>.mp4). A day
-// with a subdirectory links to its day page; a day that is a single top-level file links to the file.
+// annkepull writes) or just top-level files with the date in their name (timelapse_<YYYYMMDD>.mp4). Each
+// day links to its day page.
 //
 // annkescan writes beside each clip what it saw (recording_<...>.json) and, when it saw something, a
 // thumbnail with boxes (.jpg). A day's page marks those clips with an icon per group, the thumbnail on
 // hover; the calendar shows such days in orange, with their counts on hover. A day's results are read once
 // per change of its directory (annkescan renames its files into place, which updates the mtime).
+//
+// A camera can also have detections (detections-<name>=<directory>): the stills annkescan-realtime found
+// a vehicle in, with boxes, as <YYYYMMDD>/<YYYYMMDDHHMMSS>.jpg in UTC. They are shown by local time: the
+// calendar shows days with any in orange, with their count on hover, and a day's page lists each after the
+// day's files, the still on hover.
 //
 // Config: /etc/default/annkeserv (key=value).   Usage: annkeserv [config]
 
@@ -47,7 +53,8 @@ const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cf
 
 const CAMERAS = Object.entries(cfg)                 // camera-<name>=<directory>, in selector order
     .filter(([k, v]) => k.startsWith('camera-') && v)
-    .map(([k, v]) => ({ name: k.slice('camera-'.length), dir: v }));
+    .map(([k, v]) => k.slice('camera-'.length))
+    .map((name) => ({ name, dir: cfg[`camera-${name}`], detections: cfg[`detections-${name}`] || '' }));
 const PORT = num('port', 8088);
 const USERNAME = cfg['username'] || '';
 const PASSWORD = cfg['password'] || '';             // empty: no login
@@ -63,16 +70,24 @@ if (!CAMERAS.length) {
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const RE_DAY = /^\d{8}$/;
 const RE_FILE = /^[\w-]*?(\d{8})(\d{6})?(?:_\d+)?\.mp4$/;   // <prefix>_<YYYYMMDD>[<HHMMSS>][_<n>].mp4
+const RE_DETECTION = /^(\d{8})\d{6}\.jpg$/;         // <YYYYMMDDHHMMSS>.jpg, in UTC, in its UTC day's directory
+const two = (n) => String(n).padStart(2, '0');
 const fmtDate = (d) => `${d.slice(0, 4)} ${MONTHS[Number(d.slice(4, 6)) - 1]} ${Number(d.slice(6, 8))}`;
 const fmtTime = (t) => `${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
-const fmtSize = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+const fmtSize = (bytes) => (bytes < 1048576 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1048576).toFixed(1)} MB`);
 const fmtLength = (secs) => {
-    const s = Math.round(secs), two = (n) => String(n).padStart(2, '0');
+    const s = Math.round(secs);
     if (s >= 3600) return `${Math.floor(s / 3600)}h${two(Math.floor((s % 3600) / 60))}m`;
     return s >= 60 ? `${Math.floor(s / 60)}m${two(s % 60)}s` : `${s}s`;
 };
+// a UTC <YYYYMMDDHHMMSS> as the local date (YYYYMMDD) and time (HHMMSS)
+const localOf = (s) => {
+    const t = new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +s.slice(8, 10), +s.slice(10, 12), +s.slice(12, 14)));
+    return { date: `${t.getFullYear()}${two(t.getMonth() + 1)}${two(t.getDate())}`, time: `${two(t.getHours())}${two(t.getMinutes())}${two(t.getSeconds())}` };
+};
 
-// date -> { dir: true } for a day subdirectory, or { files: [name, ...] } for top-level files of that date
+// date -> { dir: true } for a day subdirectory, { files: [name, ...] } for top-level files of that date, and
+// { detections: [...] } for the camera's detections that (local) day
 async function listDays(cam) {
     const days = new Map();
     for (const entry of await fs.promises.readdir(cam.dir, { withFileTypes: true })) {
@@ -82,23 +97,61 @@ async function listDays(cam) {
             days.set(date, { ...day, files: [...(day.files || []), entry.name] });
         }
     }
+    for (const [date, detections] of await listDetections(cam)) days.set(date, { ...days.get(date), detections });
     return days;
 }
 
-// mp4 length from the movie header (mvhd); annkepull writes with +faststart so it is near the start
+// a camera's detections by local date: date -> [{ name, time }, ...], oldest first; a UTC day's directory is
+// re-read only when it has changed
+const detectionDirs = new Map();                    // dir -> { mtimeMs, names }
+async function listDetections(cam) {
+    const byDate = new Map();
+    if (!cam.detections) return byDate;
+    const entries = await fs.promises.readdir(cam.detections, { withFileTypes: true }).catch(() => []);
+    for (const day of entries.filter((e) => e.isDirectory() && RE_DAY.test(e.name)).map((e) => e.name).sort()) {
+        const dir = path.join(cam.detections, day), stat = await fs.promises.stat(dir);
+        let known = detectionDirs.get(dir);
+        if (known?.mtimeMs !== stat.mtimeMs) {
+            known = { mtimeMs: stat.mtimeMs, names: (await fs.promises.readdir(dir)).filter((n) => RE_DETECTION.test(n)).sort() };
+            detectionDirs.set(dir, known);
+        }
+        for (const name of known.names) {
+            const { date, time } = localOf(name.slice(0, 14));
+            if (!byDate.has(date)) byDate.set(date, []);
+            byDate.get(date).push({ name, time });
+        }
+    }
+    return byDate;
+}
+
+// mp4 length from the movie header (mvhd): near the start when written with +faststart (annkepull), else in
+// the movie box after the media (the timelapse), found by walking the top-level boxes
 const lengths = new Map();                          // file -> { mtimeMs, secs }
+function mvhdSecs(buffer) {
+    const at = buffer.indexOf('mvhd');
+    if (at < 4 || at + 36 > buffer.length) return undefined;
+    return buffer[at + 4] === 1
+        ? Number(buffer.readBigUInt64BE(at + 28)) / buffer.readUInt32BE(at + 24)
+        : buffer.readUInt32BE(at + 20) / buffer.readUInt32BE(at + 16);
+}
 async function mp4Length(file, stat) {
     const known = lengths.get(file);
     if (known?.mtimeMs === stat.mtimeMs) return known.secs;
     let secs;
     const fh = await fs.promises.open(file, 'r');
     try {
-        const { buffer, bytesRead } = await fh.read(Buffer.alloc(65536), 0, 65536, 0);
-        const at = buffer.subarray(0, bytesRead).indexOf('mvhd');
-        if (at >= 4 && at + 36 <= bytesRead)
-            secs = buffer[at + 4] === 1
-                ? Number(buffer.readBigUInt64BE(at + 28)) / buffer.readUInt32BE(at + 24)
-                : buffer.readUInt32BE(at + 20) / buffer.readUInt32BE(at + 16);
+        const read = async (at, n) => {
+            const { buffer, bytesRead } = await fh.read(Buffer.alloc(n), 0, n, at);
+            return buffer.subarray(0, bytesRead);
+        };
+        secs = mvhdSecs(await read(0, 65536));
+        // each box is <size><type>, with a size of 1 meaning a 64-bit one after the type (0: to the end)
+        for (let at = 0, n = 0; secs === undefined && at + 16 <= stat.size && n < 32; n++) {
+            const box = await read(at, 16), size = box.readUInt32BE(0) === 1 ? Number(box.readBigUInt64BE(8)) : box.readUInt32BE(0);
+            if (box.toString('latin1', 4, 8) === 'moov') secs = mvhdSecs(await read(at, 65536));
+            if (size < 8) break;
+            at += size;
+        }
     } finally {
         await fh.close();
     }
@@ -152,6 +205,11 @@ async function listDay(cam, date) {
 }
 
 function findFile(cam, name) {
+    const d = cam.detections && RE_DETECTION.exec(name);
+    if (d) {
+        const file = path.join(cam.detections, d[1], name);
+        return fs.existsSync(file) ? file : undefined;
+    }
     const m = RE_FILE.exec(name.replace(/\.jpg$/, '.mp4'));     // a clip, or annkescan's thumbnail of it
     if (!m) return undefined;
     for (const file of [path.join(cam.dir, m[1], name), path.join(cam.dir, name)]) if (fs.existsSync(file)) return file;
@@ -208,12 +266,17 @@ const STYLE = `
         .item-meta { font-family: monospace; min-width: 160px; margin-right: 16px; color: #718096; }
         .empty { color: #718096; }`;
 
-function page(title, cam, date, body) {
+async function page(title, cam, date, body) {
     // the selector keeps the day when the other camera has it
-    const selector = CAMERAS.map((c) => {
-        const href = date && fs.existsSync(path.join(c.dir, date)) ? `/${c.name}/list/${date}` : `/${c.name}/list`;
-        return `<a href="${esc(href)}"${c === cam ? ' class="current"' : ''}>${esc(c.name)}</a>`;
-    }).join('');
+    const has = async (c) => date && (fs.existsSync(path.join(c.dir, date)) || (await listDays(c).catch(() => new Map())).has(date));
+    const selector = (
+        await Promise.all(
+            CAMERAS.map(async (c) => {
+                const href = (await has(c)) ? `/${c.name}/list/${date}` : `/${c.name}/list`;
+                return `<a href="${esc(href)}"${c === cam ? ' class="current"' : ''}>${esc(c.name)}</a>`;
+            })
+        )
+    ).join('');
     return `<!DOCTYPE html>
 <html>
 <head>
@@ -246,6 +309,13 @@ function seenLines(found) {
     return lines;
 }
 
+// a day's detections, as a line: how many, and from when to when
+function detectionLine(detections) {
+    if (!detections?.length) return '';
+    const n = detections.length, first = fmtTime(detections[0].time).slice(0, 5), last = fmtTime(detections[n - 1].time).slice(0, 5);
+    return `${GROUPS.vehicles} vehicles in ${n} still${n === 1 ? '' : 's'}, ${first === last ? `at ${first}` : `${first} to ${last}`}`;
+}
+
 // as server-snapshot-list.ejs: one row per week, newest first, each row laid out Sunday .. Monday
 function calendar(cam, days, found) {
     const months = [...new Set([...days.keys()].map((d) => d.slice(0, 6)))].sort().reverse();
@@ -273,8 +343,11 @@ function calendar(cam, days, found) {
                     const card = lines.length ? `<span class="card">${[fmtDate(d.date), ...lines].map(esc).join('<br>')}</span>` : '';
                     return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link${Object.keys(f?.groups || {}).length ? ' seen' : ''}">${text}${card}</a>`;
                 }
-                if (d.info?.files?.length === 1) return `<a href="/${esc(cam.name)}/file/${esc(d.info.files[0])}" class="date-link">${text}</a>`;
-                if (d.info?.files?.length) return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link">${text}</a>`;
+                if (d.info?.files?.length || d.info?.detections) {
+                    const line = detectionLine(d.info.detections);
+                    const card = line ? `<span class="card">${[fmtDate(d.date), line].map(esc).join('<br>')}</span>` : '';
+                    return `<a href="/${esc(cam.name)}/list/${d.date}" class="date-link${line ? ' seen' : ''}">${text}${card}</a>`;
+                }
                 return `<span class="date-placeholder">${text}</span>`;
             });
             rows.push(`
@@ -322,34 +395,48 @@ const THUMB_SCRIPT = `
     </script>`;
 
 async function pageDay(cam, date, days) {
-    let entries, found;
-    if (days.get(date)?.dir) ({ entries, found } = await listDay(cam, date));
-    else
+    const day = days.get(date);
+    let entries = [], found;
+    if (day?.dir) ({ entries, found } = await listDay(cam, date));
+    else if (day?.files)
         entries = await Promise.all(
-            (days.get(date)?.files || []).sort().map(async (name) => {
-                const stat = await fs.promises.stat(path.join(cam.dir, name));
-                return { name, time: RE_FILE.exec(name)[2], size: stat.size };
+            day.files.sort().map(async (name) => {
+                const file = path.join(cam.dir, name), stat = await fs.promises.stat(file);
+                return { name, time: RE_FILE.exec(name)[2], size: stat.size, secs: await mp4Length(file, stat).catch(() => undefined) };
             })
         );
+    const detections = await Promise.all(
+        (day?.detections || []).map(async (d) => ({ ...d, size: (await fs.promises.stat(path.join(cam.detections, d.name.slice(0, 8), d.name))).size }))
+    );
     const total = entries.reduce((t, e) => t + (e.secs || 0), 0);
+    const link = (name, text, cls = '') => `<a${cls ? ` class="${cls}"` : ''} href="/${esc(cam.name)}/file/${esc(name)}" target="_blank">${text}</a>`;
     const seenIcons = (e) => {
         const icons = Object.keys(GROUPS).filter((g) => e.seen?.[g] !== undefined).map((g) => GROUPS[g]).join('');
         if (!icons) return '';
-        return e.thumb
-            ? `<a class="item-seen" href="/${esc(cam.name)}/file/${esc(e.name.replace(/\.mp4$/, '.jpg'))}" target="_blank">${icons}</a>`
-            : `<span class="item-seen">${icons}</span>`;
+        return e.thumb ? link(e.name.replace(/\.mp4$/, '.jpg'), icons, 'item-seen') : `<span class="item-seen">${icons}</span>`;
     };
-    const rows = entries.map(
-        (e) => `
+    const row = (time, meta, view) => `
             <div class="item-entry">
-                <span class="item-detail">${e.time ? fmtTime(e.time) : ''}</span><span class="item-meta">${e.secs !== undefined ? fmtLength(e.secs).padStart(6, ' ').replace(/ /g, '&nbsp;') + ' &middot; ' : ''}${fmtSize(e.size)}</span><a href="/${esc(cam.name)}/file/${esc(e.name)}" target="_blank">View Video</a>${seenIcons(e)}
-            </div>`
-    );
+                <span class="item-detail">${time ? fmtTime(time) : ''}</span><span class="item-meta">${meta}</span>${view}
+            </div>`;
+    // the files (a timelapse has no time, so first), and the detections among them, in time order
+    const rows = [
+        ...entries.map((e) => ({
+            time: e.time || '',
+            html: row(e.time, `${e.secs !== undefined ? fmtLength(e.secs).padStart(6, ' ').replace(/ /g, '&nbsp;') + ' &middot; ' : ''}${fmtSize(e.size)}`, link(e.name, 'View Video') + seenIcons(e)),
+        })),
+        ...detections.map((d) => ({ time: d.time, html: row(d.time, fmtSize(d.size), link(d.name, 'View Image') + link(d.name, GROUPS.vehicles, 'item-seen')) })),
+    ].sort((a, b) => a.time.localeCompare(b.time));
     const seen = found?.checked ? seenLines(found).slice(1).join(' &middot; ') : '';
+    const summary = [
+        entries.length ? `${entries.length} clip${entries.length === 1 ? '' : 's'}${total ? `, ${fmtLength(total)} in all` : ''}` : '',
+        seen,
+        esc(detectionLine(detections)),
+    ].filter(Boolean);
     const body = `    <h1><a href="/${esc(cam.name)}/list">${esc(cam.name)}</a>: ${fmtDate(date)}</h1>
-    <p>${entries.length} clip${entries.length === 1 ? '' : 's'}${total ? `, ${fmtLength(total)} in all` : ''}${seen ? ` &middot; ${seen}` : ''}</p>
-    <div class="item-list">${rows.join('')}
-    </div>${entries.some((e) => e.thumb) ? THUMB_SCRIPT : ''}`;
+    <p>${summary.join(' &middot; ')}</p>
+    <div class="item-list">${rows.map((r) => r.html).join('')}
+    </div>${entries.some((e) => e.thumb) || detections.length ? THUMB_SCRIPT : ''}`;
     return page(`Camera: ${cam.name}: ${fmtDate(date)}`, cam, date, body);
 }
 
